@@ -1,37 +1,49 @@
 #!/usr/bin/env bash
 set -e
 
-BUILD_DIR=$1
-CACHE_DIR=$2
-ENV_DIR=$3
-BIN_DIR=$(cd "$(dirname "$0")"; pwd)
+# --- Args provistos por Heroku buildpacks ---
+BUILD_DIR="$1"
+CACHE_DIR="$2"
+ENV_DIR="$3"
 
-# Load common functions
+# --- Ubicar y cargar utilidades del propio buildpack ---
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$BIN_DIR/common.sh"
 
-# --- Install portable Python 2 ---
+# --- Utilidad para imprimir con indent ---
+indent() { while IFS= read -r line; do printf '       %s\n' "$line"; done; }
+
+# --- Exportar variables de entorno desde ENV_DIR (si existen) ---
+export_env_dir "$ENV_DIR" || true
+
+# --- Asegurar cache dir ---
+mkdir -p "$CACHE_DIR"
+
+# --- Java 11 por defecto si no hay system.properties (solo meta; heroku/jvm ya instala 11) ---
+if [ ! -f "$BUILD_DIR/system.properties" ]; then
+  echo "java.runtime.version=11" > "$BUILD_DIR/system.properties"
+fi
+
+# --- Instalar Python 2.7 portable (para tooling de Play 1) ---
 PYTHON2_VERSION="2.7.18"
 PYTHON2_DIR=".python2"
 PYTHON2_BUILD_DIR="Python-${PYTHON2_VERSION}"
 
 if [ ! -d "$BUILD_DIR/$PYTHON2_DIR" ]; then
   echo "-----> Downloading and compiling Python ${PYTHON2_VERSION}..."
-  curl -L -o python2.tgz "https://github.com/Cliengo/heroku-buildpack-play-24/releases/download/heroku-24/Python-2.7.18.tgz"
-
+  /usr/bin/curl -L -o python2.tgz "https://github.com/Cliengo/heroku-buildpack-play-24/releases/download/heroku-24/Python-2.7.18.tgz"
   tar -xzf python2.tgz
-  rm python2.tgz
+  rm -f python2.tgz
 
-  # Extrae dentro de BUILD_DIR si no se extrajo correctamente
+  # Mover al BUILD_DIR si se extrajo en cwd
   if [ ! -d "$BUILD_DIR/$PYTHON2_BUILD_DIR" ] && [ -d "$PYTHON2_BUILD_DIR" ]; then
     mv "$PYTHON2_BUILD_DIR" "$BUILD_DIR/"
   fi
 
   cd "$BUILD_DIR/$PYTHON2_BUILD_DIR"
-
   ./configure --prefix="$BUILD_DIR/$PYTHON2_DIR" --enable-unicode=ucs4 --enable-shared
-  make -j$(nproc)
+  make -j"$(nproc)"
   make install
-
   cd "$BUILD_DIR"
   rm -rf "$PYTHON2_BUILD_DIR"
 
@@ -40,47 +52,50 @@ else
   echo "-----> Python ${PYTHON2_VERSION} already installed"
 fi
 
-# Aseguramos que el binario y la lib compartida estén disponibles en build y runtime
+# PATH/LD_LIBRARY_PATH para build
 export PATH="$BUILD_DIR/$PYTHON2_DIR/bin:$PATH"
 export LD_LIBRARY_PATH="$BUILD_DIR/$PYTHON2_DIR/lib:$LD_LIBRARY_PATH"
 
-# Runtime profile to export same LD_LIBRARY_PATH
-PY2_PROFILE="$BUILD_DIR/.profile.d/python2.sh"
-mkdir -p "$(dirname "$PY2_PROFILE")"
-cat <<EOF > "$PY2_PROFILE"
-export PATH="/app/.python2/bin:\$PATH"
-export LD_LIBRARY_PATH="/app/.python2/lib:\$LD_LIBRARY_PATH"
+# Runtime: mantener mismas vars de Python
+mkdir -p "$BUILD_DIR/.profile.d"
+cat > "$BUILD_DIR/.profile.d/python2.sh" <<'EOF'
+export PATH="/app/.python2/bin:$PATH"
+export LD_LIBRARY_PATH="/app/.python2/lib:$LD_LIBRARY_PATH"
 EOF
 
-# Crea un wrapper para play que exporta LD_LIBRARY_PATH antes de ejecutarlo
-cat <<EOF > "$BUILD_DIR/.play-wrapper"
+# Wrapper para play (opcional)
+cat > "$BUILD_DIR/.play-wrapper" <<'EOF'
 #!/bin/bash
-export LD_LIBRARY_PATH="/app/.python2/lib:\$LD_LIBRARY_PATH"
-/app/.play/play "\$@"
+export JAVA_HOME="/app/.jdk"
+export PATH="/app/.jdk/bin:$PATH"
+export LD_LIBRARY_PATH="/app/.python2/lib:$LD_LIBRARY_PATH"
+/app/.play/play "$@"
 EOF
 chmod +x "$BUILD_DIR/.play-wrapper"
 
-export_env_dir "$ENV_DIR"
-
-# Ensure cache dir exists
-mkdir -p "$CACHE_DIR"
-
-# Default system.properties (Java 1.8)
-if [ ! -f "$BUILD_DIR/system.properties" ]; then
-  echo "java.runtime.version=1.8" > "$BUILD_DIR/system.properties"
+# --- Java 11: usar el que instala heroku/jvm; NO volver a descargar ---
+echo "-----> Using Java from heroku/jvm buildpack if available..."
+if [ -n "$JAVA_HOME" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+  echo "       JAVA_HOME provided by heroku/jvm: $JAVA_HOME"
+else
+  echo "       WARNING: JAVA_HOME not set by heroku/jvm; falling back to manual install..."
+  # Solo si de verdad no vino JAVA_HOME, instalamos nosotros (usa install_openjdk "11" si tu common.sh lo soporta)
+  install_openjdk "11" "$BUILD_DIR" "$BIN_DIR"
+  export JAVA_HOME="$BUILD_DIR/.jdk"
 fi
 
-echo "-----> Installing OpenJDK..."
-javaVersion="1.8"
-install_openjdk "$javaVersion" "$BUILD_DIR" "$BIN_DIR"
-echo "       Done installing OpenJDK"
+# Asegurar en cualquier caso:
+export PATH="$JAVA_HOME/bin:$PATH"
+echo "JAVA_HOME=$JAVA_HOME"
+java -version || true
 
+# --- Paths de Play e Ivy ---
 PLAY_PATH=".play"
 IVY_PATH=".ivy2"
 
 cd "$BUILD_DIR"
 
-# Restore cache for Play and Ivy dirs
+# --- Restaurar cache de Play e Ivy si existe ---
 for DIR in "$PLAY_PATH" "$IVY_PATH"; do
   rm -rf "$DIR"
   if [ -d "$CACHE_DIR/$DIR" ]; then
@@ -89,15 +104,15 @@ for DIR in "$PLAY_PATH" "$IVY_PATH"; do
   fi
 done
 
-# Install custom Ivy settings if present
+# --- Ivy overlay opcional ---
 if [ -d "${IVY_PATH}-overlay" ]; then
   echo "-----> Installing custom Ivy files..."
   mkdir -p "$IVY_PATH"
   mv "${IVY_PATH}-overlay"/* "$IVY_PATH"
 fi
 
-# Determine Play version
-PLAY_VERSION=$(get_play_version conf/dependencies.yml)
+# --- Detectar versión de Play desde conf/dependencies.yml ---
+PLAY_VERSION="$(get_play_version "$BUILD_DIR/conf/dependencies.yml")"
 DEFAULT_PLAY_VERSION="1.3.1"
 VERSION_DECLARED=true
 
@@ -107,58 +122,56 @@ if [ -z "$PLAY_VERSION" ]; then
   echo "-----> WARNING: Play! version not specified in dependencies.yml. Using default: $PLAY_VERSION"
 fi
 
-# Install or update Play framework
+# --- Instalar/actualizar Play ---
 if [ ! -f "$PLAY_PATH/play" ]; then
-  download_play_official "$PLAY_VERSION" "$PLAY_PATH"
+  install_play "$PLAY_VERSION"
 else
-  INSTALLED_PLAY_VERSION=$(cat "$PLAY_PATH/framework/src/play/version")
+  INSTALLED_PLAY_VERSION="$(cat "$PLAY_PATH/framework/src/play/version" 2>/dev/null || echo "")"
   if [ "$INSTALLED_PLAY_VERSION" != "$PLAY_VERSION" ] && $VERSION_DECLARED; then
     echo "-----> Updating Play! from $INSTALLED_PLAY_VERSION to $PLAY_VERSION..."
     rm -rf "$PLAY_PATH"
-    download_play_official "$PLAY_VERSION" "$PLAY_PATH"
+    install_play "$PLAY_VERSION"
   fi
 fi
 
+# --- Construcción de la app ---
 echo "-----> Building Play! application..."
-"$PLAY_PATH/play" version | sed -u 's/^/       /'
+"$PLAY_PATH/play" version | indent
 
 APP_DIR="."
 echo "       Building app at $APP_DIR"
 
 DEPENDENCIES_CMD="$PLAY_PATH/play dependencies $APP_DIR --forProd --forceCopy --silent -Duser.home=$BUILD_DIR 2>&1"
 echo "       Resolving dependencies..."
-eval "$DEPENDENCIES_CMD" | sed -u 's/^/       /'
+eval "$DEPENDENCIES_CMD" | indent
 check_compile_status
 
 PRECOMPILE_CMD="$PLAY_PATH/play precompile $APP_DIR --silent 2>&1"
 echo "       Precompiling application..."
-eval "$PRECOMPILE_CMD" | sed -u 's/^/       /'
+eval "$PRECOMPILE_CMD" | indent
 check_compile_status
 
-# Save cache
+# --- Guardar cache ---
 for DIR in "$PLAY_PATH" "$IVY_PATH"; do
   rm -rf "$CACHE_DIR/$DIR"
   cp -r "$DIR" "$CACHE_DIR/$DIR"
 done
 
-# Setup .profile.d to set PATH at runtime
+# --- Variables de runtime (JAVA_HOME y PATH) ---
 PROFILE_PATH="$BUILD_DIR/.profile.d/play.sh"
 mkdir -p "$(dirname "$PROFILE_PATH")"
-cat <<EOF > "$PROFILE_PATH"
-export PATH="/app/.play:/app/.jdk/bin:/app/.tools:\$PATH"
+cat > "$PROFILE_PATH" <<'EOF'
+# Runtime env for Play 1 on Heroku
+export JAVA_HOME="/app/.jdk"
+export PATH="/app/.play:/app/.jdk/bin:/app/.tools:$PATH"
 EOF
 
-# Setup Python2 path in runtime profile
-PY2_PROFILE="$BUILD_DIR/.profile.d/python2.sh"
-mkdir -p "$(dirname "$PY2_PROFILE")"
-echo 'export PATH="/app/.python2/bin:$PATH"' > "$PY2_PROFILE"
-
-# Clean build-time dependencies
+# --- Limpiar deps de build ---
 rm -rf "$IVY_PATH"
 remove_play "$BUILD_DIR" "$PLAY_VERSION"
 
-# Warn if no Procfile
-if [ ! -f Procfile ]; then
-  echo "-----> No Procfile found. Default process: "
-  echo "       play run --http.port=\$PORT \$PLAY_OPTS"
-fi
+# --- Procfile por defecto si no existe ---
+# if [ ! -f Procfile ]; then
+#  echo "-----> No Procfile found. Default process: "
+#  echo "       play run --http.port=$PORT $PLAY_OPTS"
+# fi
